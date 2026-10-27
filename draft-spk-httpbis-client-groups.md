@@ -20,18 +20,20 @@ venue:
   type: "Working Group"
   mail: "ietf-http-wg@w3.org"
   arch: "https://lists.w3.org/Archives/Public/ietf-http-wg/"
+  github: "santoshpallagatti/draft-spk-httpbis-client-groups"
+  latest: "https://santoshpallagatti.github.io/draft-spk-httpbis-client-groups/draft-spk-httpbis-client-groups.html"
 
 author:
  -
     ins: S. Pallagatti
-    name: Santosh Pallagatti Kotrabasappa
-    org: Zscaler
+    fullname: Santosh Pallagatti Kotrabasappa
+    organization: Zscaler
     country: India
     email: santosh.pallagatti@gmail.com
  -
     ins: P. Sharma
-    name: Pranjal Sharma
-    org: Zscaler
+    fullname: Pranjal Sharma
+    organization: Zscaler
     email: pranjal.sharma@zscaler.com
 
 normative:
@@ -221,7 +223,7 @@ not see individual requests and are not in scope.
 ### Collateral Damage from One Client {#collateral}
 
 An origin's defenses against abuse act on a connection or a source
-address. When that connection or address is shared, a defence aimed at
+address. When that connection or address is shared, a defense aimed at
 one client lands on all of them. This is not hypothetical. When the
 HTTP/2 "Rapid Reset" attack {{CVE-2023-44487}} was disclosed in 2023, a
 common mitigation was to close any connection on which a client reset too
@@ -306,8 +308,9 @@ R2:
   other clients on the same connection ({{frame}}).
 
 R3:
-: The origin does not learn the identity of any client, and cannot link
-  a client across connections ({{field}}, {{privacy}}).
+: The origin does not learn the identity of any client, and cannot use
+  the client-group identifier to follow a client across connections
+  ({{field}}, {{privacy}}).
 
 R4:
 : The mechanism works for every combination of HTTP/2 and HTTP/3 between
@@ -325,8 +328,7 @@ This document uses the terms "intermediary", "origin server" (or
 "origin"), "connection" and "request" from {{HTTP}}. In frame diagrams,
 a field marked (i) is a variable-length integer as defined in
 {{Section 16 of QUIC}}, and "..." indicates that the length of the field
-varies. Structured Field
-types are defined in {{STRUCTURED-FIELDS}}.
+varies. Structured Field types are defined in {{STRUCTURED-FIELDS}}.
 
 The following terms are also used:
 
@@ -590,13 +592,13 @@ and Length followed by the payload shown in {{fig-h3-frame}}.
 {: #fig-h3-frame title="HTTP/3 GROUP_CONTROL Frame Payload"}
 
 The fields are in the same order and, apart from Boundary, have the same
-size and meaning as in HTTP/2 ({{frame-h2}}). Boundary carries a QUIC stream identifier, which
-can be up to 62 bits long. As with the Stream ID field of the HTTP/3
-GOAWAY frame, it is encoded as a variable-length integer
-({{Section 16 of QUIC}}), so the number of bytes it takes on the wire
-depends on its value. It
-works like the Stream ID field of a GOAWAY frame sent by an HTTP/3
-server, but only for streams of the named group ({{boundary}}).
+size and meaning as in HTTP/2 ({{frame-h2}}). Boundary carries a QUIC
+stream identifier, which can be up to 62 bits long. As with the Stream ID
+field of the HTTP/3 GOAWAY frame, it is encoded as a variable-length
+integer ({{Section 16 of QUIC}}), so the number of bytes it takes on the
+wire depends on its value. It works like the Stream ID field of a GOAWAY
+frame sent by an HTTP/3 server, but only for streams of the named group
+({{boundary}}).
 
 Receiving GROUP_CONTROL on any stream other than the control stream MUST
 be treated as a connection error of type H3_FRAME_UNEXPECTED. A frame
@@ -642,9 +644,9 @@ suitable connection. If Value is 1, the intermediary MUST from then on
 send that client's requests for this origin key only on a connection that
 carries no other client group.
 
-Other client groups on the connection are not affected. An origin MAY
-send GOAWAY for the same group more than once, but the Boundary MUST NOT
-increase between frames.
+A Value other than 0 or 1 MUST be treated as 0. Other client groups on
+the connection are not affected. An origin MAY send GOAWAY for the same
+group more than once, but the Boundary MUST NOT increase between frames.
 
 ### BLOCK
 
@@ -666,8 +668,9 @@ requests from that client in progress across all connections with the
 same origin key. It can queue excess requests for a bounded time or
 refuse them, but MUST NOT buffer them without limit. A Value of 0 is
 invalid and the frame MUST be ignored. A LIMIT has no expiry: it lasts
-until CLEAR is received or the intermediary releases the client group. A
-new LIMIT replaces the previous one.
+until CLEAR is received or the client no longer has requests to this
+origin key through the intermediary. A new LIMIT replaces the previous
+one.
 
 ### CLEAR
 
@@ -707,8 +710,8 @@ Requests that might have been processed are allowed to complete.
 
 GROUP_CONTROL does not reset streams. An origin that wants to stop some
 or all of a group's requests in progress, for instance together with a
-BLOCK, resets those streams itself with RST_STREAM (HTTP/2) or
-RESET_STREAM (HTTP/3), as it would on any connection. It knows which
+BLOCK, resets those streams itself, with RST_STREAM in HTTP/2 or a QUIC
+RESET_STREAM frame in HTTP/3, as it would on any connection. It knows which
 streams belong to the group from their Client-Group fields. The error
 code says what the client can safely do: REFUSED_STREAM or
 H3_REQUEST_REJECTED for a request the origin did not process, and CANCEL
@@ -804,8 +807,9 @@ separately on each connection and are never copied across.
 ## Connection States {#lifecycle}
 
 A shared connection is in one of three states. It is ACTIVE once the
-handshake is done and the origin's SETTINGS have arrived, and new
-requests can be placed on it. It becomes DRAINING when a GOAWAY is
+handshake is done, and new requests can be placed on it; until the
+origin's SETTINGS arrive, those requests come from at most one client
+group ({{neg-procedures}}). It becomes DRAINING when a GOAWAY is
 received or the intermediary decides to retire it; no new requests are
 placed on it, and those in progress are handled as in {{conn-goaway}}.
 It is CLOSED when it has ended, at which point every request still in
