@@ -2,7 +2,7 @@
 title: "Client Groups for Shared HTTP Connections"
 abbrev: "Client Groups"
 category: std
-docname:    docname: draft-spk-httpbis-client-groups-latest
+docname: draft-spk-httpbis-client-groups-latest
 submissiontype: IETF
 number:
 date:
