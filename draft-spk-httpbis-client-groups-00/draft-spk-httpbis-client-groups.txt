@@ -1,0 +1,1400 @@
+
+
+
+
+HTTP                                                       S. Pallagatti
+Internet-Draft                                                 P. Sharma
+Intended status: Standards Track                                 Zscaler
+Expires: 2 May 2027                                      29 October 2026
+
+
+               Client Groups for Shared HTTP Connections
+                 draft-spk-httpbis-client-groups-latest
+
+Abstract
+
+   Intermediaries often carry requests from many unrelated clients over
+   one HTTP/2 or HTTP/3 connection to an origin server.  The origin has
+   no way to know this, to say whether it accepts it, or to act on the
+   traffic of one client without disturbing every other client on the
+   connection.  This document defines a pair of settings that let an
+   intermediary and an origin agree on whether a connection is shared, a
+   request header field that marks which client a request belongs to,
+   and a frame that lets the origin drain, block, or limit one client on
+   a shared connection.  It also states what an intermediary needs to do
+   so that GOAWAY and connection failures reach only the affected client
+   streams.
+
+About This Document
+
+   This note is to be removed before publishing as an RFC.
+
+   The latest revision of this draft can be found at
+   https://santoshpallagatti.github.io/draft-spk-httpbis-client-groups/
+   draft-spk-httpbis-client-groups.html.  Status information for this
+   document may be found at https://datatracker.ietf.org/doc/draft-spk-
+   httpbis-client-groups/.
+
+   Discussion of this document takes place on the HTTP Working Group
+   mailing list (mailto:ietf-http-wg@w3.org), which is archived at
+   https://lists.w3.org/Archives/Public/ietf-http-wg/.
+
+   Source for this draft and an issue tracker can be found at
+   https://github.com/santoshpallagatti/draft-spk-httpbis-client-groups.
+
+Status of This Memo
+
+   This Internet-Draft is submitted in full conformance with the
+   provisions of BCP 78 and BCP 79.
+
+   Internet-Drafts are working documents of the Internet Engineering
+   Task Force (IETF).  Note that other groups may also distribute
+   working documents as Internet-Drafts.  The list of current Internet-
+   Drafts is at https://datatracker.ietf.org/drafts/current/.
+
+   Internet-Drafts are draft documents valid for a maximum of six months
+   and may be updated, replaced, or obsoleted by other documents at any
+   time.  It is inappropriate to use Internet-Drafts as reference
+   material or to cite them other than as "work in progress."
+
+   This Internet-Draft will expire on 2 May 2027.
+
+Copyright Notice
+
+   Copyright (c) 2026 IETF Trust and the persons identified as the
+   document authors.  All rights reserved.
+
+   This document is subject to BCP 78 and the IETF Trust's Legal
+   Provisions Relating to IETF Documents (https://trustee.ietf.org/
+   license-info) in effect on the date of publication of this document.
+   Please review these documents carefully, as they describe your rights
+   and restrictions with respect to this document.  Code Components
+   extracted from this document must include Revised BSD License text as
+   described in Section 4.e of the Trust Legal Provisions and are
+   provided without warranty as described in the Revised BSD License.
+
+Table of Contents
+
+   1.  Introduction
+     1.1.  Scope
+   2.  Motivation and Use Cases
+     2.1.  Why Intermediaries Share Connections
+     2.2.  Deployment Scenarios
+       2.2.1.  TLS-Inspecting Forward Proxies
+       2.2.2.  CDNs and Reverse Proxies
+       2.2.3.  API Gateways and Service Meshes
+     2.3.  Problems
+       2.3.1.  Collateral Damage from One Client
+       2.3.2.  Unfair Use of a Shared Connection
+       2.3.3.  Connection-Bound State
+       2.3.4.  Failures Affect Many Clients
+     2.4.  Why Existing Mechanisms Are Not Enough
+     2.5.  Requirements
+   3.  Conventions and Definitions
+   4.  Overview
+   5.  Negotiation
+     5.1.  SETTINGS_SHARED_CONNECTION
+     5.2.  SETTINGS_SHARED_CONNECTION_POLICY
+     5.3.  Procedures
+   6.  The Client-Group Header Field
+   7.  The GROUP_CONTROL Frame
+     7.1.  HTTP/2 Frame
+     7.2.  HTTP/3 Frame
+     7.3.  Actions
+       7.3.1.  GOAWAY
+       7.3.2.  BLOCK
+       7.3.3.  LIMIT
+       7.3.4.  CLEAR
+     7.4.  Acceptance Boundary
+     7.5.  Stopping Requests in Progress
+     7.6.  Error Handling
+     7.7.  Relationship to GOAWAY and Stream Resets
+   8.  Intermediary Requirements
+     8.1.  Origin Key
+     8.2.  Request Handling
+     8.3.  Stream Map
+     8.4.  Connection States
+     8.5.  Connection-Wide GOAWAY
+     8.6.  Connection Failure
+     8.7.  Different HTTP Versions on the Two Sides
+   9.  Security Considerations
+     9.1.  Shared Compression State
+     9.2.  Forged Groups and Actions
+     9.3.  Misbehaving Origins
+     9.4.  Retry Safety
+     9.5.  Denial of Service
+     9.6.  Downgrade
+   10. Privacy Considerations
+   11. IANA Considerations
+     11.1.  HTTP/2 Settings
+     11.2.  HTTP/3 Settings
+     11.3.  HTTP/2 Frame Type
+     11.4.  HTTP/3 Frame Type
+     11.5.  HTTP Field Name
+     11.6.  GROUP_CONTROL Actions
+   12. References
+     12.1.  Normative References
+     12.2.  Informative References
+   Appendix A.  Examples
+     A.1.  Blocking One Client
+     A.2.  Moving One Client Off a Connection
+   Appendix B.  Related Work
+   Acknowledgments
+   Authors' Addresses
+
+1.  Introduction
+
+   Intermediaries such as forward proxies, CDNs and API gateways
+   commonly carry requests from many unrelated clients over a small
+   number of HTTP/2 [HTTP2] or HTTP/3 [HTTP3] connections to each
+   origin.  Sharing connections this way saves handshakes, connections
+   and latency, and both the intermediary and the origin benefit from
+   it.
+
+   HTTP/2 and HTTP/3, however, treat a connection as belonging to one
+   client.  When a connection is shared, the origin cannot tell the
+   clients on it apart, cannot say whether it accepts sharing, and has
+   no way to act on one client without affecting all of them.  Section 2
+   describes where this arises and why it matters.
+
+   This document defines a pair of settings with which an intermediary
+   and an origin agree on whether a connection is shared (Section 5), a
+   request header field identifying which requests belong to the same
+   client (Section 6), and a frame with which the origin can act on one
+   client (Section 7).  Section 8 sets out what an intermediary has to
+   do so that events on a shared connection reach only the clients they
+   affect.
+
+1.1.  Scope
+
+   This document applies to HTTP/2 and HTTP/3 connections from an
+   intermediary to an origin.  The version a client uses to reach the
+   intermediary does not matter; any combination of HTTP/2 and HTTP/3 on
+   the two sides works the same way.  HTTP/1.1 is out of scope, since it
+   cannot carry concurrent requests on one connection.
+
+   Nothing defined here appears on the client side of the intermediary.
+   Clients need no changes and are not aware of the mechanism.
+
+2.  Motivation and Use Cases
+
+2.1.  Why Intermediaries Share Connections
+
+   Intermediaries share upstream connections because doing so is
+   considerably cheaper for both sides than the alternative.
+
+   Each new connection costs a TLS or QUIC handshake, with public-key
+   operations at both ends and at least one round trip before the first
+   request can be sent.  A new connection also starts with a small
+   congestion window.  An intermediary that opened one connection per
+   client would multiply these costs by the number of clients using each
+   origin, which for a popular origin can be tens of thousands at a
+   time.
+
+   Intermediaries also send traffic from a limited set of source
+   addresses.  Origins and the load balancers in front of them commonly
+   limit connections per source address, and the intermediary itself can
+   run out of source ports towards a given destination.  One connection
+   per client reaches these limits quickly.
+
+   Origins benefit as well.  Fewer, busier connections mean fewer
+   handshakes to perform and less memory held for idle connections.
+
+   HTTP/2 and HTTP/3 make sharing practical, because a single connection
+   can carry many requests at the same time.  With HTTP/1.1, a reused
+   connection could only serve one request after another.  As a result,
+   carrying the requests of many clients over one connection has become
+   normal in large intermediaries.  This document does not try to
+   discourage it; it aims to make it safe.
+
+2.2.  Deployment Scenarios
+
+2.2.1.  TLS-Inspecting Forward Proxies
+
+   Many organizations send their users' web traffic through a forward
+   proxy, often operated as a cloud service, that applies security
+   policy such as malware scanning, URL filtering and data-loss
+   prevention.  To inspect HTTPS traffic, the proxy terminates the
+   user's TLS connection, using a certificate that the organization's
+   devices are configured to trust.  It then makes its own connection to
+   the origin the user asked for.
+
+   Such a proxy usually serves many organizations at once and sends
+   their traffic out through a shared pool of addresses.  When thousands
+   of users from different organizations use the same popular
+   application, the proxy carries their requests over a few connections
+   to that application's origin, each connection interleaving requests
+   from many users who have no relationship with one another.
+
+   Consider a client that starts sending requests the origin considers
+   abusive: for example, credential-stuffing login attempts, scraping
+   beyond the application's terms, or a misconfigured tool retrying in a
+   tight loop.  Each request is well formed and goes to a permitted
+   application, so it passes the proxy's security policy.  Only the
+   origin, which knows its own accounts, quotas and application logic,
+   can tell that the traffic is a problem.
+
+   The origin sees an unusually busy connection from one of the proxy's
+   addresses.  Its choices today are to throttle that connection, send
+   GOAWAY, close it, or block the proxy's address.  Each of these also
+   affects thousands of other users, mostly from organizations unrelated
+   to the client responsible, who see failed requests, challenge pages
+   or blocks.  The proxy knows which client is responsible but has no
+   way to learn what the origin objected to; the origin knows what is
+   wrong but cannot see the client.
+
+   With this document, the origin asks the proxy to block or limit that
+   one client for a period.  The proxy applies this to that client only
+   and can report the event to the client's organization, and the origin
+   never learns who the client is.
+
+   This scenario is where the problems below are most acute.  The proxy
+   is mandated by the organization rather than optional, TLS is
+   terminated in any case, the number of clients per connection is
+   large, and the clients sharing a connection belong to unrelated
+   organizations.
+
+2.2.2.  CDNs and Reverse Proxies
+
+   CDNs and reverse proxies carry requests from many visitors over
+   shared connections to an origin, and some operators document this
+   behavior publicly.  The origin is often operated by a different party
+   from the CDN, and has the same lack of visibility into the clients
+   behind each connection.
+
+2.2.3.  API Gateways and Service Meshes
+
+   Within a deployment, gateways and service-mesh proxies forward
+   requests from many callers to backend services over shared
+   connections.  Here both ends are usually run by one operator, but the
+   protocol-level problems are the same, and a standard mechanism avoids
+   each deployment inventing its own.
+
+   Intermediaries that relay traffic using CONNECT or other tunneling
+   methods, where TLS runs end to end between the client and the origin,
+   do not see individual requests and are not in scope.
+
+2.3.  Problems
+
+2.3.1.  Collateral Damage from One Client
+
+   An origin's defenses against abuse act on a connection or a source
+   address.  When that connection or address is shared, a defense aimed
+   at one client lands on all of them.  This is not hypothetical.  When
+   the HTTP/2 "Rapid Reset" attack [CVE-2023-44487] was disclosed in
+   2023, a common mitigation was to close any connection on which a
+   client reset too many streams.  On a shared connection, one client
+   triggering that mitigation closes the connection for every client on
+   it.
+
+2.3.2.  Unfair Use of a Shared Connection
+
+   One client with many concurrent requests can consume most of a
+   connection's stream concurrency and flow-control window, delaying
+   every other client on it.  The origin can see this happening but
+   cannot limit one client without limiting the connection.
+
+2.3.3.  Connection-Bound State
+
+   Some origins associate state with a connection, such as
+   authentication performed by connection-oriented schemes, session
+   affinity or per-connection rate limits.  Such an origin needs each
+   connection to carry one client, but it has no way to tell an
+   intermediary so.
+
+2.3.4.  Failures Affect Many Clients
+
+   When a shared connection receives GOAWAY or fails, requests from many
+   clients fail together.  Operators of HTTP/2-to-origin proxies have
+   reported increased client-visible errors for exactly this reason
+   [ATS-H2].  Correct handling requires the intermediary to work out,
+   for each affected client, which requests the origin processed.
+   HTTP/2 and HTTP/3 express that differently, and no specification
+   describes how to do it.
+
+2.4.  Why Existing Mechanisms Are Not Enough
+
+   Using a separate connection for each client avoids the problems but
+   gives up the benefits described in Section 2.1, and does not scale
+   for a large intermediary.
+
+   GOAWAY (Section 6.8 of [HTTP2], Section 5.2 of [HTTP3]) acts on the
+   whole connection.  It stops new requests on the connection but cannot
+   single out the requests of one client, so using it against one client
+   drains every client on the connection.  It also achieves little: the
+   intermediary moves the affected requests to another connection, the
+   offending client's requests included, and the problem moves with
+   them.  GOAWAY does not tell the intermediary which client caused it.
+   Resetting individual streams, for example with ENHANCE_YOUR_CALM or
+   H3_EXCESSIVE_LOAD, stops a single request but does not stop the
+   client from sending more, and to the intermediary it looks no
+   different from any other reset.
+
+   Fields such as Forwarded [RFC7239] tell the origin who the client is.
+   That reveals the client's identity to the origin, which many
+   deployments cannot accept, and still gives the origin no means of
+   acting on one client short of the whole connection.
+
+   Responding to each unwanted request with 429 (Too Many Requests) does
+   not stop the requests from arriving.  The origin still receives and
+   processes each one, and has no way to ask the intermediary to stop
+   sending them.
+
+   RateLimit header fields [RATELIMIT] inform a client of a quota but do
+   not distinguish clients behind an intermediary.  Privacy Pass rate
+   limiting [PP-RATELIMIT] requires every client to take part.
+
+   Blocking or throttling the intermediary's address is the collateral
+   damage described in Section 2.3.1.
+
+   The underlying difficulty is that neither side can solve this alone.
+   The intermediary knows the clients but not the origin's policy or
+   what the origin considers abusive.  The origin knows its policy but
+   cannot see the clients.  Solving it needs a signal between the two,
+   which is why it needs a standard.
+
+2.5.  Requirements
+
+   The mechanism in this document is designed to meet the following
+   requirements:
+
+   R1:  An origin can allow, limit or refuse the sharing of a connection
+      (Section 5).
+
+   R2:  An origin can act on the requests of one client without
+      affecting other clients on the same connection (Section 7).
+
+   R3:  The origin does not learn the identity of any client, and cannot
+      use the client-group identifier to follow a client across
+      connections (Section 6, Section 10).
+
+   R4:  The mechanism works for every combination of HTTP/2 and HTTP/3
+      between client and intermediary and between intermediary and
+      origin (Section 8.7).
+
+   R5:  Endpoints that do not implement this document are unaffected.
+
+3.  Conventions and Definitions
+
+   The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+   "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+   "OPTIONAL" in this document are to be interpreted as described in
+   BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all
+   capitals, as shown here.
+
+   This document uses the terms "intermediary", "origin server" (or
+   "origin"), "connection" and "request" from [HTTP].  In frame
+   diagrams, a field marked (i) is a variable-length integer as defined
+   in Section 16 of [QUIC], and "..." indicates that the length of the
+   field varies.  Structured Field types are defined in
+   [STRUCTURED-FIELDS].
+
+   The following terms are also used:
+
+   Shared connection:  An HTTP/2 or HTTP/3 connection from an
+      intermediary to an origin that may carry requests for more than
+      one client group at the same time.
+
+   Client group:  The requests that an intermediary attributes to one of
+      its clients.  What a client group corresponds to (a client
+      connection, an authenticated user, or something else) is up to the
+      intermediary, but it has to stay the same for as long as that
+      client uses a shared connection.
+
+   Client-group identifier:  The integer the intermediary uses for a
+      client group on one shared connection, carried in the Client-Group
+      header field.
+
+   Origin key:  The set of properties that decides which upstream
+      connections a request may use.  Two requests can share a
+      connection only if their origin keys are equal (Section 8.1).  For
+      example, two requests for https://api.example.com that use the
+      same TLS settings have the same origin key, while a request for
+      the same host that has to present a particular user's client
+      certificate has a different one, and so needs a different
+      connection.
+
+   Acceptance boundary:  A stream identifier, carried in GOAWAY or
+      GROUP_CONTROL, that separates streams the origin might have
+      processed from streams it has not processed (Section 7.4).
+
+4.  Overview
+
+   Figure 1 shows three clients reaching one origin through an
+   intermediary.  Clients A and C use HTTP/2 and client B uses HTTP/3.
+   Their requests are carried on two shared connections, T1 (HTTP/2) and
+   T2 (HTTP/3).
+
+   +----------+
+   | Client A |==h2==+
+   +----------+      |      +--------------------+
+                     |      |    Intermediary    |      +--------+
+   +----------+      +=====>|                    |==T1==>|        |
+   | Client B |==h3========>|     stream map,    |  h2   | Origin |
+   +----------+      +=====>|  connection pool   |==T2==>|        |
+                     |      |   (by origin key)  |  h3   +--------+
+   +----------+      |      +--------------------+
+   | Client C |==h2==+
+   +----------+
+
+          Figure 1: Client Requests Carried on Shared Connections
+
+   An intermediary that may share a connection sends
+   SETTINGS_SHARED_CONNECTION when it opens it, and puts a Client-Group
+   field on every request it sends there.  An origin that implements
+   this document answers with SETTINGS_SHARED_CONNECTION_POLICY, giving
+   the number of client groups it will accept on that connection.  If
+   the origin needs to deal with one client, it sends GROUP_CONTROL
+   naming that client's group, and the intermediary applies it to that
+   client only.
+
+   Endpoints that do not implement this document ignore the unknown
+   settings, field and frame type, as HTTP/2 and HTTP/3 already require,
+   and nothing changes for them.
+
+5.  Negotiation
+
+   Two settings are defined.  Each is registered for HTTP/2
+   (Section 6.5.2 of [HTTP2]) and HTTP/3 (Section 7.2.4.1 of [HTTP3])
+   with the same name and meaning.
+
+5.1.  SETTINGS_SHARED_CONNECTION
+
+   The intermediary sends SETTINGS_SHARED_CONNECTION (TBD1 in HTTP/2,
+   TBD2 in HTTP/3) with a value of 1 to say that the connection may
+   carry requests for more than one client group.  The default is 0.
+   Any value other than 0 or 1 MUST be treated as a connection error of
+   type PROTOCOL_ERROR in HTTP/2 or H3_SETTINGS_ERROR in HTTP/3.
+
+   Only the client end of a connection sends this setting.  A client
+   that receives it from a server MUST ignore it.
+
+   An intermediary that sends SETTINGS_SHARED_CONNECTION with a value of
+   1 MUST support the Client-Group field (Section 6) and the
+   GROUP_CONTROL frame (Section 7).
+
+5.2.  SETTINGS_SHARED_CONNECTION_POLICY
+
+   An origin that implements this document sends
+   SETTINGS_SHARED_CONNECTION_POLICY (TBD3 in HTTP/2, TBD4 in HTTP/3).
+   The value is the largest number of client groups the origin accepts
+   on the connection, with two special cases: 0 means there is no limit,
+   and 1 means the connection is not to be shared at all.
+
+   There is no default.  If the setting is absent, the origin does not
+   implement this document.  Only the server end sends it; a server MUST
+   ignore it if a client sends it.
+
+   An origin SHOULD send this setting only when it has received
+   SETTINGS_SHARED_CONNECTION with a value of 1.  Because an HTTP/2
+   server can send its first SETTINGS frame before it sees the client's,
+   an origin MAY instead send it on every connection.  An intermediary
+   that did not send SETTINGS_SHARED_CONNECTION ignores it.
+
+5.3.  Procedures
+
+   An intermediary that may share a connection MUST include
+   SETTINGS_SHARED_CONNECTION with a value of 1 in the first SETTINGS
+   frame it sends, and MUST include a Client-Group field in every
+   request it sends on the connection from the first request onwards.
+
+   Both HTTP/2 and HTTP/3 let a client send requests before the server's
+   SETTINGS arrive, and with TLS early data or QUIC 0-RTT a request can
+   go out in the very first flight.  To keep that, the intermediary does
+   not wait for the origin's SETTINGS before sending requests.  It does,
+   however, limit itself to one client group until they arrive: until it
+   has received the origin's first SETTINGS frame, the intermediary MUST
+   NOT send requests for more than one client group on the connection.
+   A single client group is not sharing, so no policy can be broken, and
+   it is also what an origin that sends a policy of 1 allows.
+
+   If the origin's first SETTINGS frame does not contain
+   SETTINGS_SHARED_CONNECTION_POLICY, the origin does not implement this
+   document.  The intermediary MUST stop sending the Client-Group field
+   on that connection.  Whether it shares the connection anyway is a
+   local matter, as it is today.
+
+   If the origin sends a policy value N greater than zero, the
+   intermediary MUST NOT have requests for more than N client groups in
+   progress on the connection at any time.
+
+   Neither setting changes after the first SETTINGS frame.  In HTTP/2, a
+   SETTINGS frame that changes either value MUST be treated as a
+   connection error of type PROTOCOL_ERROR.  An origin that wants a
+   different policy sends GOAWAY and uses the new policy on later
+   connections.  HTTP/3 does not allow settings to change, so this keeps
+   the two versions aligned.
+
+6.  The Client-Group Header Field
+
+   Client-Group is a request header field carrying the client-group
+   identifier.  It is an Item Structured Field [STRUCTURED-FIELDS] whose
+   value is an Integer between 0 and 4294967295 inclusive.  No
+   parameters are defined, and unknown parameters MUST be ignored.
+
+   GET /orders HTTP/1.1
+   Host: api.example.com
+   Client-Group: 48213
+
+              Figure 2: Request Carrying a Client-Group Field
+
+   The field is sent once per request, in the request's header section.
+   It is not sent in trailers.  Each request travels on its own stream,
+   so a client with several requests in progress has the same Client-
+   Group value on each of those streams, and requests from different
+   clients are on different streams with different values.
+
+   Identifiers MUST be chosen at random from the full range.  They MUST
+   NOT come from a counter or be derived from anything that identifies
+   the client, such as its credentials or network address.  A counter
+   would tell the origin how many clients the intermediary has and the
+   order in which they arrived.
+
+   An identifier MUST be unique among the client groups that have
+   requests in progress on the connection, and MUST be the same for
+   every request of a given client group on that connection.  The same
+   client group SHOULD get an unrelated identifier on each connection,
+   so that the origin cannot use it to follow a client from one
+   connection to another.  An identifier MAY be reused for another
+   client group once the previous group has no requests in progress and
+   the intermediary has released it.  An identifier has meaning only on
+   the connection where it was sent.
+
+   The intermediary MUST remove any Client-Group field from requests it
+   receives from clients.  Otherwise a client could pick, or
+   impersonate, a group.
+
+   Client-Group only appears in requests.  Responses are matched to
+   requests by stream, as usual.  An origin MUST NOT send Client-Group
+   in a response, and an intermediary MUST remove it from any response
+   before forwarding.
+
+   Client-Group carries no confidential information and can be
+   compressed like any other field.
+
+7.  The GROUP_CONTROL Frame
+
+   An origin sends GROUP_CONTROL to tell the intermediary to act on one
+   client group.  A response header field would not work here: the
+   origin may need to act when it has no response to send for that
+   group, and the intermediary needs an acceptance boundary to know
+   which of the group's requests were processed.
+
+   An origin MUST NOT send GROUP_CONTROL unless it has received
+   SETTINGS_SHARED_CONNECTION with a value of 1 and has sent
+   SETTINGS_SHARED_CONNECTION_POLICY.
+
+7.1.  HTTP/2 Frame
+
+   In HTTP/2, GROUP_CONTROL is an extension frame (Section 5.5 of
+   [HTTP2]) of type TBD5.  It is sent on stream 0, which HTTP/2 uses for
+   frames that concern the connection rather than a single request; like
+   GOAWAY, GROUP_CONTROL can affect several streams at once.  The frame
+   defines no flags.  It uses the common HTTP/2 frame header
+   (Section 4.1 of [HTTP2]), followed by the payload shown in Figure 3.
+
+       +---------------------------------------------------------------+
+       |                       Client-Group (32)                       |
+       +---------------------------------------------------------------+
+       |                          Value (32)                           |
+       +---------------+-----------------------------------------------+
+       |  Action (8)   |
+       +-+-------------+-----------------------------------------------+
+       |R|                      Boundary (31)                          |
+       +-+-------------------------------------------------------------+
+
+                Figure 3: HTTP/2 GROUP_CONTROL Frame Payload
+
+   Client-Group:  The client-group identifier (Section 6) the frame
+      applies to.
+
+   Value:  A parameter whose meaning depends on the action
+      (Section 7.3).
+
+   Action:  The action to apply (Section 7.3).
+
+   R:  A reserved bit.  It MUST be set to zero when sending and MUST be
+      ignored when receiving.
+
+   Boundary:  The acceptance boundary for the named group (Section 7.4).
+      It works like the Last-Stream-ID field of an HTTP/2 GOAWAY frame,
+      but only for streams of that group.
+
+   A GROUP_CONTROL frame on a stream other than 0 MUST be treated as a
+   connection error of type PROTOCOL_ERROR.  The payload has a fixed
+   size of 13 octets; a GROUP_CONTROL frame of any other length MUST be
+   treated as a connection error of type FRAME_SIZE_ERROR.
+
+7.2.  HTTP/3 Frame
+
+   In HTTP/3, GROUP_CONTROL is a frame of type TBD6 and is only sent on
+   the control stream, which plays the role that stream 0 plays in
+   HTTP/2.  It uses the common HTTP/3 frame layout (Section 7.1 of
+   [HTTP3]), with Type and Length followed by the payload shown in
+   Figure 4.
+
+       +---------------------------------------------------------------+
+       |                       Client-Group (32)                       |
+       +---------------------------------------------------------------+
+       |                          Value (32)                           |
+       +---------------+-----------------------------------------------+
+       |  Action (8)   |
+       +---------------+-----------------------------------------------+
+       |                         Boundary (i)                        ...
+       +---------------------------------------------------------------+
+
+                Figure 4: HTTP/3 GROUP_CONTROL Frame Payload
+
+   The fields are in the same order and, apart from Boundary, have the
+   same size and meaning as in HTTP/2 (Section 7.1).  Boundary carries a
+   QUIC stream identifier, which can be up to 62 bits long.  As with the
+   Stream ID field of the HTTP/3 GOAWAY frame, it is encoded as a
+   variable-length integer (Section 16 of [QUIC]), so the number of
+   bytes it takes on the wire depends on its value.  It works like the
+   Stream ID field of a GOAWAY frame sent by an HTTP/3 server, but only
+   for streams of the named group (Section 7.4).
+
+   Receiving GROUP_CONTROL on any stream other than the control stream
+   MUST be treated as a connection error of type H3_FRAME_UNEXPECTED.  A
+   frame that cannot be parsed, or that has data left over after the
+   last field, MUST be treated as a connection error of type
+   H3_FRAME_ERROR.
+
+7.3.  Actions
+
+   The Action field holds one of the values in Table 1.
+
+       +======+========+============+==============================+
+       | Code | Action | Value      | Effect                       |
+       +======+========+============+==============================+
+       | 0x00 | GOAWAY | 0 or 1     | Stop sending this group on   |
+       |      |        |            | this connection              |
+       +------+--------+------------+------------------------------+
+       | 0x01 | BLOCK  | seconds    | Stop sending this client to  |
+       |      |        | (1-86400)  | this origin key for a time   |
+       +------+--------+------------+------------------------------+
+       | 0x02 | LIMIT  | streams (1 | Cap this client's concurrent |
+       |      |        | or more)   | requests to this origin key  |
+       +------+--------+------------+------------------------------+
+       | 0x03 | CLEAR  | ignored    | Lift a BLOCK or end a LIMIT  |
+       +------+--------+------------+------------------------------+
+
+                       Table 1: GROUP_CONTROL Actions
+
+   GOAWAY applies to the connection the frame arrived on.  BLOCK and
+   LIMIT apply to the client behind the group on every connection the
+   intermediary has with the same origin key (Section 8.1); otherwise a
+   blocked client could simply be moved to another connection.
+
+   The intermediary MUST ignore a GROUP_CONTROL frame with an Action it
+   does not recognize, and one that names a client-group identifier not
+   in use on the connection.  New actions can be added through the
+   registry in Section 11.6.
+
+7.3.1.  GOAWAY
+
+   GOAWAY moves one client off the connection.  On receiving it, the
+   intermediary stops sending requests for that group on the connection
+   and sends the client's later requests on another suitable connection.
+   If Value is 1, that other connection must carry no other client
+   group: the origin is asking for the client to be given a connection
+   of its own, for example because it keeps per-connection state for
+   that client.
+
+   More precisely, the intermediary MUST NOT send any further request
+   for the named group on the connection.  Requests of the group already
+   in progress are handled according to the acceptance boundary
+   (Section 7.4).  Later requests from the client SHOULD be sent on
+   another suitable connection.  If Value is 1, the intermediary MUST
+   from then on send that client's requests for this origin key only on
+   a connection that carries no other client group.
+
+   A Value other than 0 or 1 MUST be treated as 0.  Other client groups
+   on the connection are not affected.  An origin MAY send GOAWAY for
+   the same group more than once, but the Boundary MUST NOT increase
+   between frames.
+
+7.3.2.  BLOCK
+
+   On receiving BLOCK, the intermediary MUST NOT send requests from that
+   client to any connection with the same origin key for Value seconds.
+   In the meantime it SHOULD answer those requests itself with a 429
+   (Too Many Requests) response [RFC6585] carrying a Retry-After field
+   (Section 10.2.3 of [HTTP]).
+
+   BLOCK does not affect requests already in progress; Section 7.5
+   describes how the origin stops those.  A Value of 0 or above 86400 is
+   invalid, and the intermediary MUST ignore a BLOCK frame carrying one.
+   A new BLOCK for the same client replaces the previous one.
+
+7.3.3.  LIMIT
+
+   On receiving LIMIT, the intermediary MUST NOT have more than Value
+   requests from that client in progress across all connections with the
+   same origin key.  It can queue excess requests for a bounded time or
+   refuse them, but MUST NOT buffer them without limit.  A Value of 0 is
+   invalid and the frame MUST be ignored.  A LIMIT has no expiry: it
+   lasts until CLEAR is received or the client no longer has requests to
+   this origin key through the intermediary.  A new LIMIT replaces the
+   previous one.
+
+7.3.4.  CLEAR
+
+   CLEAR lets the origin undo its own restrictions.  It lifts a BLOCK
+   before it expires, for example when the abuse has stopped, and it is
+   the only way for the origin to end a LIMIT.  On receiving CLEAR, the
+   intermediary removes any BLOCK or LIMIT in force for the client and
+   origin key.  CLEAR does not undo a GOAWAY.
+
+7.4.  Acceptance Boundary
+
+   For the GOAWAY action, the Boundary field tells the intermediary
+   which of the group's requests the origin might have processed.  It
+   covers only streams of the named group and follows the GOAWAY rule of
+   the HTTP version of the connection.  Note that the two versions
+   express the boundary in opposite ways: HTTP/2 gives the last stream
+   that might have been processed, and HTTP/3 gives the first stream
+   that will not be.
+
+      +===========================+================+================+
+      |                           | HTTP/2         | HTTP/3         |
+      +===========================+================+================+
+      | Might have been processed | ID <= Boundary | ID < Boundary  |
+      +---------------------------+----------------+----------------+
+      | Not processed             | ID > Boundary  | ID >= Boundary |
+      +---------------------------+----------------+----------------+
+
+                        Table 2: Acceptance Boundary
+
+   The intermediary MUST apply the rule for the version of the
+   connection the frame was received on.  For actions other than GOAWAY
+   the origin SHOULD set Boundary to 0, and the intermediary MUST ignore
+   it.
+
+   A request that the boundary shows was not processed can be retried
+   whatever its method (Section 8.7 of [HTTP2], Section 4.1.1 of
+   [HTTP3]).  The intermediary MAY retry it on another suitable
+   connection.  If it does not, it MUST reset the client stream with
+   REFUSED_STREAM (HTTP/2) or H3_REQUEST_REJECTED (HTTP/3), so that the
+   client knows it can retry.  Requests that might have been processed
+   are allowed to complete.
+
+7.5.  Stopping Requests in Progress
+
+   GROUP_CONTROL does not reset streams.  An origin that wants to stop
+   some or all of a group's requests in progress, for instance together
+   with a BLOCK, resets those streams itself, with RST_STREAM in HTTP/2
+   or a QUIC RESET_STREAM frame in HTTP/3, as it would on any
+   connection.  It knows which streams belong to the group from their
+   Client-Group fields.  The error code says what the client can safely
+   do: REFUSED_STREAM or H3_REQUEST_REJECTED for a request the origin
+   did not process, and CANCEL or H3_REQUEST_CANCELLED for one it might
+   have processed.
+
+   The origin can send GROUP_CONTROL and the resets together.  Requests
+   the intermediary sent before it received a BLOCK may still reach the
+   origin afterwards; the origin refuses them in the same way.
+
+   The intermediary relays each reset to the matching client stream,
+   using the client connection's error code (Table 3).
+
+7.6.  Error Handling
+
+   An origin that receives GROUP_CONTROL MUST treat it as a connection
+   error of type PROTOCOL_ERROR (HTTP/2) or H3_FRAME_UNEXPECTED
+   (HTTP/3).
+
+   An intermediary that receives GROUP_CONTROL on a connection where it
+   did not send SETTINGS_SHARED_CONNECTION with a value of 1 MUST treat
+   it as a connection error of the same type.  (An intermediary that
+   does not implement this document simply ignores the unknown frame
+   type.)
+
+7.7.  Relationship to GOAWAY and Stream Resets
+
+   GROUP_CONTROL does not replace anything.  An origin that wants to
+   retire a whole connection still sends an ordinary GOAWAY, and a
+   single stream is still reset with RST_STREAM or RESET_STREAM.  Every
+   implementation already understands those, and a second way of doing
+   either would only invite conflicting signals.  GROUP_CONTROL covers
+   the case in between: one client on a connection that carries several.
+
+8.  Intermediary Requirements
+
+   This section applies to an intermediary that sends
+   SETTINGS_SHARED_CONNECTION with a value of 1.  Its purpose is to make
+   sure that an event on a shared connection reaches the clients it
+   affects, and only those.
+
+8.1.  Origin Key
+
+   An intermediary MUST NOT send two requests on the same shared
+   connection unless they have the same:
+
+   *  scheme, host and port;
+
+   *  TLS server name;
+
+   *  certificate validation policy for the origin, including trust
+      anchors and pinning;
+
+   *  client certificate presented to the origin, if any;
+
+   *  application protocol (h2 or h3); and
+
+   *  required protocol extensions, such as Extended CONNECT ([RFC8441],
+      [RFC9220]) or HTTP Datagrams [RFC9297].
+
+   It MAY add more attributes, for example a tenant identifier, an
+   inspection policy or a regional constraint.  When it serves tenants
+   that do not trust each other, it SHOULD include the tenant, which
+   limits what one tenant can learn from shared compression state.
+
+   Requests that rely on state bound to the connection, such as
+   connection-oriented authentication or a client certificate belonging
+   to one user, MUST NOT be sent on a connection shared with another
+   client group.
+
+8.2.  Request Handling
+
+   Sharing a connection does not merge requests.  Each request keeps its
+   own header section and travels on its own stream, and a field
+   received from one client MUST NOT be added to a request of another
+   client group.
+
+   As for any intermediary, connection-specific fields such as
+   Connection, Keep-Alive, Proxy-Connection, Transfer-Encoding and
+   Upgrade are removed before forwarding (Section 7.6.1 of [HTTP],
+   Section 8.2.2 of [HTTP2], Section 4.2 of [HTTP3]), and fields
+   addressed to the intermediary itself, such as Proxy-Authorization,
+   are consumed rather than forwarded.  Fields that carry a client's
+   credentials, such as Cookie and Authorization, are forwarded only on
+   that client's requests and are subject to the compression rules in
+   Section 9.1.
+
+   Requests a client sent in TLS early data or QUIC 0-RTT MUST NOT be
+   put on a shared connection unless the intermediary has decided that
+   replay is safe; the Early-Data field and the 425 status code
+   [RFC8470] apply.  Server push SHOULD be turned off on shared
+   connections.
+
+8.3.  Stream Map
+
+   For each request on a shared connection, the intermediary MUST keep
+   track of the client connection and stream, the shared connection and
+   upstream stream, the client-group identifier, and how far the request
+   has got: whether the request header section has been sent, whether
+   the request content is complete and can be sent again, and whether a
+   response header section has been received and forwarded.  Stream
+   identifiers are assigned separately on each connection and are never
+   copied across.
+
+8.4.  Connection States
+
+   A shared connection is in one of three states.  It is ACTIVE once the
+   handshake is done, and new requests can be placed on it; until the
+   origin's SETTINGS arrive, those requests come from at most one client
+   group (Section 5.3).  It becomes DRAINING when a GOAWAY is received
+   or the intermediary decides to retire it; no new requests are placed
+   on it, and those in progress are handled as in Section 8.5.  It is
+   CLOSED when it has ended, at which point every request still in the
+   stream map is completed, retried or failed as in Section 8.6.
+
+   Moving from ACTIVE to DRAINING MUST be atomic with respect to placing
+   requests, so that nothing is placed on a connection after the
+   intermediary has processed a GOAWAY for it.
+
+8.5.  Connection-Wide GOAWAY
+
+   When a GOAWAY arrives on a shared connection, the intermediary moves
+   it to DRAINING and applies the boundary in Table 2 to every request
+   in progress, using the stream map to find the client stream for each.
+   Requests that were not processed are retried or refused as described
+   in Section 7.4; the rest are allowed to finish.
+
+   An intermediary MUST NOT close a client connection, or send GOAWAY on
+   it, only because a shared connection carrying some of its streams is
+   draining.
+
+   For planned rotation, origins SHOULD use the two-step GOAWAY
+   described in Section 6.8 of [HTTP2] and Section 5.2 of [HTTP3], so
+   that no request is caught in flight.
+
+8.6.  Connection Failure
+
+   When a shared connection ends without a GOAWAY, because of a
+   transport reset, an idle timeout or a load balancer closing it, there
+   is no boundary to go on.  For each request in the stream map the
+   intermediary MAY send it on another suitable connection if no part of
+   it had been sent on the failed one.  It MAY retry it once if the
+   method is idempotent (Section 9.2.2 of [HTTP]), no response header
+   section was received, and the content can be sent again.  Otherwise
+   it MUST NOT retry: it resets the client stream with INTERNAL_ERROR
+   (HTTP/2) or H3_INTERNAL_ERROR (HTTP/3), or, if no response has
+   started, sends an error response with a Proxy-Status field [RFC9209]
+   using the "connection_terminated" error type.
+
+   An intermediary MUST NOT reset a client stream with REFUSED_STREAM or
+   H3_REQUEST_REJECTED unless it knows the origin did not process the
+   request.  Clients take those codes as permission to retry any
+   request, including a non-idempotent one.
+
+   While no suitable connection is available, the intermediary MUST put
+   a bound on how much request content it buffers and on how long it
+   waits, and SHOULD reconnect with exponential backoff.  It SHOULD
+   limit the number of client streams per shared connection, and MAY
+   keep more than one shared connection per origin key, so that a single
+   failure affects fewer clients.
+
+8.7.  Different HTTP Versions on the Two Sides
+
+   A client and the shared connection carrying its requests can use
+   different HTTP versions.  For example, a client using HTTP/3 can be
+   carried on an HTTP/2 shared connection, or the other way round.
+   Three rules cover this.
+
+   First, the settings, the Client-Group field and the GROUP_CONTROL
+   frame exist only on the shared connection.  Whatever version a client
+   uses, its requests are tagged and controlled in the same way.
+
+   Second, when something that happens on the shared connection affects
+   a client's request, such as a stream reset or a GOAWAY, the
+   intermediary tells the client using the error code of the client's
+   own connection, translated as in Table 3.  For example, a request
+   refused with REFUSED_STREAM on an HTTP/2 shared connection is
+   reported to an HTTP/3 client as H3_REQUEST_REJECTED.
+
+   Third, an acceptance boundary is always read with the rule of the
+   shared connection's version (Table 2), never the client's.
+
+    +===================+======================+=====================+
+    | HTTP/2            | HTTP/3               | Meaning             |
+    +===================+======================+=====================+
+    | REFUSED_STREAM    | H3_REQUEST_REJECTED  | Not processed; safe |
+    |                   |                      | to retry            |
+    +-------------------+----------------------+---------------------+
+    | CANCEL            | H3_REQUEST_CANCELLED | Cancelled; might    |
+    |                   |                      | have been processed |
+    +-------------------+----------------------+---------------------+
+    | INTERNAL_ERROR    | H3_INTERNAL_ERROR    | Failure at the peer |
+    |                   |                      | or intermediary     |
+    +-------------------+----------------------+---------------------+
+    | ENHANCE_YOUR_CALM | H3_EXCESSIVE_LOAD    | Peer overloaded     |
+    +-------------------+----------------------+---------------------+
+    | CONNECT_ERROR     | H3_CONNECT_ERROR     | Tunnel failed       |
+    +-------------------+----------------------+---------------------+
+
+                       Table 3: Stream Error Codes
+
+   Two practical differences are worth noting.  Stream limits are
+   expressed differently: HTTP/2 uses SETTINGS_MAX_CONCURRENT_STREAMS,
+   while HTTP/3 relies on the cumulative MAX_STREAMS credit of QUIC
+   [QUIC], and the intermediary has to enforce the sharing policy and
+   LIMIT against whichever applies.  And packet loss on an HTTP/2 shared
+   connection holds up every stream on it, including those of HTTP/3
+   clients that would not otherwise be affected; intermediaries SHOULD
+   keep such connections lightly loaded, or use HTTP/3 to the origin
+   where it is available.
+
+9.  Security Considerations
+
+9.1.  Shared Compression State
+
+   Putting requests from clients that do not trust each other on one
+   connection exposes them to compression attacks (Section 7.1 of
+   [HPACK], Section 7.1 of [QPACK]).  On shared connections,
+   intermediaries MUST send sensitive fields such as Cookie and
+   Authorization as never-indexed literals, MUST NOT turn a never-
+   indexed field received from a client into an indexed one, and SHOULD
+   keep tenants on separate connections.
+
+9.2.  Forged Groups and Actions
+
+   A client cannot choose its group, because the intermediary strips
+   Client-Group from client requests.  A client cannot send
+   GROUP_CONTROL either, because the frame only exists on the
+   intermediary-to-origin connection and the intermediary only accepts
+   it from the origin.
+
+9.3.  Misbehaving Origins
+
+   An origin can only use GROUP_CONTROL against requests addressed to
+   itself.  BLOCK and LIMIT are tied to an origin key and MUST NOT be
+   applied to any other origin, and BLOCK is capped at 86400 seconds.
+   An intermediary MAY apply its own limits to the actions it honors.
+
+9.4.  Retry Safety
+
+   If REFUSED_STREAM or H3_REQUEST_REJECTED were used for a request the
+   origin had in fact processed, clients would repeat it, non-idempotent
+   or not.  Origins therefore need to choose reset codes accurately
+   (Section 7.5), and intermediaries follow the acceptance boundary and
+   the rules in Section 8.6.
+
+9.5.  Denial of Service
+
+   When many clients share a connection, the origin's connection-level
+   defenses land on all of them.  This document gives the origin a way
+   to target one client instead.  Intermediaries SHOULD also stop any
+   single client group from using more than a fair share of a
+   connection's stream concurrency and flow-control window.
+
+9.6.  Downgrade
+
+   The settings and the frame are protected by TLS or QUIC, so an on-
+   path attacker cannot remove them.  An endpoint that does not
+   implement this document behaves exactly as it would without it.
+
+10.  Privacy Considerations
+
+   Client-group identifiers are random, local to one connection, and not
+   derived from who the client is.  The origin learns which requests on
+   a connection come from the same client and how many groups are
+   active, but not who the clients are, and it cannot recognize a client
+   across connections by its identifier.  That is less than Forwarded
+   [RFC7239] already discloses.
+
+   The origin can still correlate requests of one group within a
+   connection.  An intermediary that does not want this can make each
+   client connection its own group.
+
+11.  IANA Considerations
+
+   RFC Editor: please replace TBD1 to TBD6 throughout this document with
+   the values assigned by IANA, and remove this note.
+
+11.1.  HTTP/2 Settings
+
+   IANA is asked to add the following to the "HTTP/2 Settings" registry
+   [HTTP2]:
+
+    +======+==========================+===============+===============+
+    | Code | Name                     | Initial Value | Reference     |
+    +======+==========================+===============+===============+
+    | TBD1 | SHARED_CONNECTION        | 0             | This document |
+    +------+--------------------------+---------------+---------------+
+    | TBD3 | SHARED_CONNECTION_POLICY | N/A           | This document |
+    +------+--------------------------+---------------+---------------+
+
+                                  Table 4
+
+11.2.  HTTP/3 Settings
+
+   IANA is asked to add the following to the "HTTP/3 Settings" registry
+   [HTTP3]:
+
+   +=====+=================================+=======+=========+=========+
+   |Value|Setting Name                     |Default|Status   |Reference|
+   +=====+=================================+=======+=========+=========+
+   |TBD2 |SETTINGS_SHARED_CONNECTION       |0      |permanent|This     |
+   |     |                                 |       |         |document |
+   +-----+---------------------------------+-------+---------+---------+
+   |TBD4 |SETTINGS_SHARED_CONNECTION_POLICY|N/A    |permanent|This     |
+   |     |                                 |       |         |document |
+   +-----+---------------------------------+-------+---------+---------+
+
+                                  Table 5
+
+11.3.  HTTP/2 Frame Type
+
+   IANA is asked to add the following to the "HTTP/2 Frame Type"
+   registry [HTTP2]:
+
+                 +======+===============+===============+
+                 | Code | Frame Type    | Reference     |
+                 +======+===============+===============+
+                 | TBD5 | GROUP_CONTROL | This document |
+                 +------+---------------+---------------+
+
+                                 Table 6
+
+11.4.  HTTP/3 Frame Type
+
+   IANA is asked to add the following to the "HTTP/3 Frame Types"
+   registry [HTTP3]:
+
+           +=======+===============+===========+===============+
+           | Value | Frame Type    | Status    | Reference     |
+           +=======+===============+===========+===============+
+           | TBD6  | GROUP_CONTROL | permanent | This document |
+           +-------+---------------+-----------+---------------+
+
+                                  Table 7
+
+11.5.  HTTP Field Name
+
+   IANA is asked to add the following to the "Hypertext Transfer
+   Protocol (HTTP) Field Name Registry" (Section 18.4 of [HTTP]):
+
+   Field Name:  Client-Group
+
+   Status:  permanent
+
+   Structured Type:  Item
+
+   Reference:  This document
+
+11.6.  GROUP_CONTROL Actions
+
+   IANA is asked to create a registry called "HTTP GROUP_CONTROL
+   Actions" in the "Hypertext Transfer Protocol (HTTP) Parameters"
+   group.  The policy is Specification Required (Section 4.6 of
+   [RFC8126]).  Each entry has a code between 0x00 and 0xff (so that it
+   fits the HTTP/2 Action field), a name, a description of the Value
+   field, and a reference.  The initial entries are those in Table 1.
+
+12.  References
+
+12.1.  Normative References
+
+   [HPACK]    Peon, R. and H. Ruellan, "HPACK: Header Compression for
+              HTTP/2", RFC 7541, DOI 10.17487/RFC7541, May 2015,
+              <https://www.rfc-editor.org/rfc/rfc7541>.
+
+   [HTTP]     Fielding, R., Ed., Nottingham, M., Ed., and J. Reschke,
+              Ed., "HTTP Semantics", STD 97, RFC 9110,
+              DOI 10.17487/RFC9110, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9110>.
+
+   [HTTP2]    Thomson, M., Ed. and C. Benfield, Ed., "HTTP/2", RFC 9113,
+              DOI 10.17487/RFC9113, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9113>.
+
+   [HTTP3]    Bishop, M., Ed., "HTTP/3", RFC 9114, DOI 10.17487/RFC9114,
+              June 2022, <https://www.rfc-editor.org/rfc/rfc9114>.
+
+   [QPACK]    Krasic, C., Bishop, M., and A. Frindell, Ed., "QPACK:
+              Field Compression for HTTP/3", RFC 9204,
+              DOI 10.17487/RFC9204, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9204>.
+
+   [QUIC]     Iyengar, J., Ed. and M. Thomson, Ed., "QUIC: A UDP-Based
+              Multiplexed and Secure Transport", RFC 9000,
+              DOI 10.17487/RFC9000, May 2021,
+              <https://www.rfc-editor.org/rfc/rfc9000>.
+
+   [RFC2119]  Bradner, S., "Key words for use in RFCs to Indicate
+              Requirement Levels", BCP 14, RFC 2119,
+              DOI 10.17487/RFC2119, March 1997,
+              <https://www.rfc-editor.org/rfc/rfc2119>.
+
+   [RFC6585]  Nottingham, M. and R. Fielding, "Additional HTTP Status
+              Codes", RFC 6585, DOI 10.17487/RFC6585, April 2012,
+              <https://www.rfc-editor.org/rfc/rfc6585>.
+
+   [RFC8126]  Cotton, M., Leiba, B., and T. Narten, "Guidelines for
+              Writing an IANA Considerations Section in RFCs", BCP 26,
+              RFC 8126, DOI 10.17487/RFC8126, June 2017,
+              <https://www.rfc-editor.org/rfc/rfc8126>.
+
+   [RFC8174]  Leiba, B., "Ambiguity of Uppercase vs Lowercase in RFC
+              2119 Key Words", BCP 14, RFC 8174, DOI 10.17487/RFC8174,
+              May 2017, <https://www.rfc-editor.org/rfc/rfc8174>.
+
+   [RFC8470]  Thomson, M., Nottingham, M., and W. Tarreau, "Using Early
+              Data in HTTP", RFC 8470, DOI 10.17487/RFC8470, September
+              2018, <https://www.rfc-editor.org/rfc/rfc8470>.
+
+   [STRUCTURED-FIELDS]
+              Nottingham, M. and P. Kamp, "Structured Field Values for
+              HTTP", RFC 9651, DOI 10.17487/RFC9651, September 2024,
+              <https://www.rfc-editor.org/rfc/rfc9651>.
+
+12.2.  Informative References
+
+   [ATS-H2]   Hinrichs, S., "Proxy Pains and Benefits Supporting HTTP/2
+              End to End", ApacheCon 2021, September 2021,
+              <https://trafficcontrol.apache.org/events/apachecon.2021/
+              ApacheConn-H2-to-origin.pdf>.
+
+   [CVE-2023-44487]
+              CVE Program, "CVE-2023-44487: HTTP/2 Rapid Reset", October
+              2023, <https://www.cve.org/CVERecord?id=CVE-2023-44487>.
+
+   [OHAI-FEEDBACK]
+              Reddy.K, T., Wing, D., Boucadair, M., and R. Polli,
+              "Oblivious Relay Feedback", Work in Progress, Internet-
+              Draft, draft-rdb-ohai-feedback-to-proxy-09, 14 May 2023,
+              <https://datatracker.ietf.org/doc/html/draft-rdb-ohai-
+              feedback-to-proxy-09>.
+
+   [PP-RATELIMIT]
+              Hendrickson, S., Iyengar, J., Pauly, T., Valdez, S., and
+              C. A. Wood, "Rate-Limited Token Issuance Protocol", Work
+              in Progress, Internet-Draft, draft-ietf-privacypass-rate-
+              limit-tokens-06, 1 April 2024,
+              <https://datatracker.ietf.org/doc/html/draft-ietf-
+              privacypass-rate-limit-tokens-06>.
+
+   [RATELIMIT]
+              Polli, R., Ruiz, A. M., and D. Miller, "RateLimit header
+              fields for HTTP", Work in Progress, Internet-Draft, draft-
+              ietf-httpapi-ratelimit-headers-11, 23 May 2026,
+              <https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-
+              ratelimit-headers-11>.
+
+   [RFC7239]  Petersson, A. and M. Nilsson, "Forwarded HTTP Extension",
+              RFC 7239, DOI 10.17487/RFC7239, June 2014,
+              <https://www.rfc-editor.org/rfc/rfc7239>.
+
+   [RFC8336]  Nottingham, M. and E. Nygren, "The ORIGIN HTTP/2 Frame",
+              RFC 8336, DOI 10.17487/RFC8336, March 2018,
+              <https://www.rfc-editor.org/rfc/rfc8336>.
+
+   [RFC8441]  McManus, P., "Bootstrapping WebSockets with HTTP/2",
+              RFC 8441, DOI 10.17487/RFC8441, September 2018,
+              <https://www.rfc-editor.org/rfc/rfc8441>.
+
+   [RFC9209]  Nottingham, M. and P. Sikora, "The Proxy-Status HTTP
+              Response Header Field", RFC 9209, DOI 10.17487/RFC9209,
+              June 2022, <https://www.rfc-editor.org/rfc/rfc9209>.
+
+   [RFC9220]  Hamilton, R., "Bootstrapping WebSockets with HTTP/3",
+              RFC 9220, DOI 10.17487/RFC9220, June 2022,
+              <https://www.rfc-editor.org/rfc/rfc9220>.
+
+   [RFC9297]  Schinazi, D. and L. Pardue, "HTTP Datagrams and the
+              Capsule Protocol", RFC 9297, DOI 10.17487/RFC9297, August
+              2022, <https://www.rfc-editor.org/rfc/rfc9297>.
+
+   [RFC9412]  Bishop, M., "The ORIGIN Extension in HTTP/3", RFC 9412,
+              DOI 10.17487/RFC9412, June 2023,
+              <https://www.rfc-editor.org/rfc/rfc9412>.
+
+   [RFC9458]  Thomson, M. and C. A. Wood, "Oblivious HTTP", RFC 9458,
+              DOI 10.17487/RFC9458, January 2024,
+              <https://www.rfc-editor.org/rfc/rfc9458>.
+
+   [WRAP-UP]  Schinazi, D. and L. Pardue, "The HTTP Wrap Up Capsule",
+              Work in Progress, Internet-Draft, draft-ietf-httpbis-wrap-
+              up-01, 7 July 2025,
+              <https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-
+              wrap-up-01>.
+
+Appendix A.  Examples
+
+   The examples below use HTTP/2 on the shared connection and follow the
+   layout of Section 5.1 of [RFC8441].  Frames sent by the intermediary
+   are on the left and frames sent by the origin on the right.  Clients
+   A and B share the connection as client groups 48213 and 907.
+
+A.1.  Blocking One Client
+
+   Client B is flooding the origin with POST requests, three of which
+   are in progress on streams 39, 43 and 45.  The origin has processed
+   stream 39 but not 43 or 45.  It blocks client B for 60 seconds and
+   resets B's streams.  Client A's request on stream 37 is not affected.
+
+   [[ From Intermediary ]]          [[ From Origin ]]
+
+   SETTINGS
+   SHARED_CONNECTION = 1
+                                    SETTINGS
+                                    SHARED_CONNECTION_POLICY = 0
+
+   HEADERS + END_HEADERS + END_STREAM
+   + STREAM_ID = 37
+   :method = GET
+   :path = /orders
+   client-group = 48213
+
+   HEADERS + END_HEADERS
+   + STREAM_ID = 39, 43, 45
+   :method = POST
+   :path = /search
+   client-group = 907
+   DATA ...
+                                    GROUP_CONTROL
+                                    + STREAM_ID = 0
+                                    Client-Group = 907
+                                    Action = BLOCK
+                                    Value = 60
+
+                                    RST_STREAM
+                                    + STREAM_ID = 39
+                                    Error Code = CANCEL
+
+                                    RST_STREAM
+                                    + STREAM_ID = 43, 45
+                                    Error Code = REFUSED_STREAM
+
+                                    HEADERS + END_HEADERS + END_STREAM
+                                    + STREAM_ID = 37
+                                    :status = 200
+
+                       Figure 5: Blocking One Client
+
+   Client B uses HTTP/3, so the intermediary resets the client stream
+   that carried stream 39 with H3_REQUEST_CANCELLED, telling B that the
+   request might have been processed, and the client streams that
+   carried 43 and 45 with H3_REQUEST_REJECTED, telling B that they were
+   not and can be retried.  For the next 60 seconds it answers B's
+   requests to this origin itself with 429 and a Retry-After field.
+   Client A receives its 200 response as normal.
+
+A.2.  Moving One Client Off a Connection
+
+   The origin wants client B on a connection of its own.  B has requests
+   in progress on streams 39, 43 and 45, and the origin has accepted
+   those up to stream 43.
+
+   [[ From Intermediary ]]          [[ From Origin ]]
+
+                                    GROUP_CONTROL
+                                    + STREAM_ID = 0
+                                    Client-Group = 907
+                                    Action = GOAWAY
+                                    Boundary = 43
+                                    Value = 1
+
+                Figure 6: Moving One Client Off a Connection
+
+   Streams 39 and 43 are at or below the boundary and complete on this
+   connection.  Stream 45 is above it, so the origin did not process it;
+   the intermediary sends that request again on a new connection that
+   carries only client B, and sends B's later requests to this origin
+   there as well.  Client A carries on using the original connection.
+
+Appendix B.  Related Work
+
+   The closest earlier proposal the authors are aware of is
+   [OHAI-FEEDBACK], which lets a target ask an Oblivious HTTP [RFC9458]
+   relay to rate-limit an offending client without learning who it is,
+   using RateLimit fields in a response.  The goal is similar.  The
+   setting is not: Oblivious HTTP encapsulates each request separately
+   and does not share a connection, the signal can only travel on a
+   response, and there is no negotiation, tagging, boundary or drain.
+
+   RateLimit fields [RATELIMIT] describe quota to a client and do not
+   distinguish clients behind an intermediary.  An origin can keep
+   sending them on responses to a client group, and the intermediary
+   forwards them as usual.  LIMIT in this document controls concurrency,
+   not rate, so the two fit together.
+
+   The WRAP_UP capsule [WRAP-UP] lets an intermediary tell a client that
+   one long-lived stream, such as a tunnel, is about to end.  Its
+   introduction makes the same point as Section 8.5: a gateway that maps
+   client requests onto a pool of origin connections should not send
+   GOAWAY to clients just because one origin connection is closing.  An
+   intermediary could use WRAP_UP toward clients whose tunnels run on a
+   draining shared connection or on a group that received GROUP_CONTROL
+   GOAWAY.
+
+   The ORIGIN frame ([RFC8336], [RFC9412]) controls which origins share
+   a connection, not which clients.
+
+Acknowledgments
+
+   TODO acknowledge.
+
+Authors' Addresses
+
+   Santosh Pallagatti Kotrabasappa
+   Zscaler
+   India
+   Email: santosh.pallagatti@gmail.com
+
+
+   Pranjal Sharma
+   Zscaler
+   Email: pranjal.sharma@zscaler.com
